@@ -6,12 +6,22 @@
    - Download from: https://www.elastic.co/downloads/elasticsearch
    - Or use Docker (recommended for local dev):
      ```bash
+     # Basic setup (data NOT persistent - will be lost on container removal)
      docker run -d -p 9200:9200 -p 9300:9300 \
        -e "discovery.type=single-node" \
        -e "xpack.security.enabled=false" \
        -e "xpack.security.enrollment.enabled=false" \
        docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+     
+     # With persistent volume (recommended - data survives container restarts)
+     docker run -d -p 9200:9200 -p 9300:9300 \
+       -e "discovery.type=single-node" \
+       -e "xpack.security.enabled=false" \
+       -e "xpack.security.enrollment.enabled=false" \
+       -v elasticsearch-data:/usr/share/elasticsearch/data \
+       docker.elastic.co/elasticsearch/elasticsearch:8.11.0
      ```
+     **Note**: The first command creates a temporary container. Use the second command with `-v` flag for persistent data storage. See `PERSISTENCE.md` for details.
    - **Note**: Security is disabled for local development. For production, enable security and use proper authentication.
 
 2. **Verify Elasticsearch is running**

@@ -40,7 +40,10 @@ backend/
 ├── main.py              # FastAPI application and routes
 ├── data_loader.py       # Module for loading data from JSON
 ├── chat_service.py      # Module for AI chat functionality
-├── data.json            # JSON file with synthetic data
+├── data/                # Data folder containing JSON files
+│   ├── data.json            # JSON file with synthetic data
+│   ├── companies_data.json  # Company data
+│   └── enriched_profiles.json  # Profile data
 ├── requirements.txt     # Python dependencies
 └── README.md           # This file
 ```
@@ -76,6 +79,9 @@ Once the server is running, visit:
 
 ## Data Files
 
-- `data.json` - Contains companies, names, and designations used for synthetic data generation
-- Data is loaded via `data_loader.py` module with caching for performance
+All data files are located in the `data/` folder:
+- `data/data.json` - Contains companies, names, and designations used for synthetic data generation
+- `data/companies_data.json` - Contains company information
+- `data/enriched_profiles.json` - Contains enriched profile data
+- Data is loaded via respective loader modules (`data_loader.py`, `company_loader.py`, `profile_loader.py`) with caching for performance
 

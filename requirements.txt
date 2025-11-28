@@ -9,4 +9,6 @@ PyPDF2
 python-docx
 sentence-transformers
 torch
+sqlalchemy
+rapidfuzz
 

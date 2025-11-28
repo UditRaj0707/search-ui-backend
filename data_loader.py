@@ -5,7 +5,7 @@ from typing import List, Dict, Any
 
 # Get the directory where this file is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(BASE_DIR, "data.json")
+DATA_FILE = os.path.join(BASE_DIR, "data", "data.json")
 
 # Cache for loaded data
 _data_cache: Dict[str, List[str]] = None

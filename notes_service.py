@@ -1,72 +1,95 @@
-"""Notes service for storing and retrieving notes per card"""
-import json
+"""Notes service for storing and retrieving notes per card - using Elasticsearch only"""
 import logging
-from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
+from elasticsearch_service import (
+    check_elasticsearch_connection,
+    index_note,
+    get_card_by_id_es
+)
 
 logger = logging.getLogger(__name__)
 
-# Path to notes storage file
-BASE_DIR = Path(__file__).parent
-NOTES_FILE = BASE_DIR / "notes.json"
-
-# In-memory cache
-_notes_cache: Optional[Dict[str, str]] = None
-
-
-def _load_notes() -> Dict[str, str]:
-    """Load notes from file"""
-    global _notes_cache
-    
-    if _notes_cache is not None:
-        return _notes_cache
-    
-    if NOTES_FILE.exists():
-        try:
-            with open(NOTES_FILE, 'r', encoding='utf-8') as f:
-                _notes_cache = json.load(f)
-                return _notes_cache
-        except Exception as e:
-            logger.error(f"Failed to load notes: {e}")
-            _notes_cache = {}
-            return _notes_cache
-    else:
-        _notes_cache = {}
-        return _notes_cache
-
-
-def _save_notes(notes: Dict[str, str]) -> bool:
-    """Save notes to file"""
-    global _notes_cache
-    
-    try:
-        with open(NOTES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(notes, f, indent=2, ensure_ascii=False)
-        _notes_cache = notes
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save notes: {e}")
-        return False
-
 
 def get_note(card_id: str) -> str:
-    """Get note for a card"""
-    notes = _load_notes()
-    return notes.get(card_id, "")
+    """Get note for a card from Elasticsearch"""
+    try:
+        if not check_elasticsearch_connection():
+            return ""
+        
+        from elasticsearch_service import es, INDEX_NOTES
+        note_id = f"note_{card_id}"
+        try:
+            response = es.get(index=INDEX_NOTES, id=note_id)
+            # Try to get note_text from metadata first (new format)
+            metadata = response["_source"].get("metadata", {})
+            if "note_text" in metadata:
+                return metadata["note_text"]
+            # Fallback: extract from content (old format)
+            content = response["_source"].get("content", "")
+            note_text = content.split("Company:")[0].split("Person:")[0].split("Industry:")[0].strip()
+            return note_text
+        except Exception:
+            return ""
+    except Exception as e:
+        logger.error(f"Failed to get note for {card_id}: {e}")
+        return ""
 
 
 def save_note(card_id: str, note: str) -> bool:
-    """Save note for a card"""
-    notes = _load_notes()
-    notes[card_id] = note
-    return _save_notes(notes)
+    """Save note for a card to Elasticsearch"""
+    try:
+        if not check_elasticsearch_connection():
+            logger.warning("Elasticsearch not available, cannot save note")
+            return False
+        
+        # Get card to determine card_type
+        card = get_card_by_id_es(card_id)
+        if not card:
+            logger.warning(f"Card {card_id} not found, cannot save note")
+            return False
+        
+        # Determine card_type from dict
+        if not card:
+            logger.error(f"Card {card_id} not found")
+            return False
+        
+        card_type = card.get("card_type", "unknown")
+        if card_type == "company":
+            card_metadata = {
+                "name": card.get("name"),
+                "industry": card.get("industry"),
+                "location": card.get("location"),
+                "description": card.get("description")
+            }
+        elif card_type == "person":
+            card_metadata = {
+                "name": card.get("name"),
+                "company": card.get("company"),
+                "designation": card.get("designation"),
+                "education": card.get("education"),
+                "location": card.get("location")
+            }
+        else:
+            logger.error(f"Unknown card type for {card_id}")
+            return False
+        
+        # Index note in Elasticsearch
+        return index_note(card_id, note, card_type, card_metadata)
+    except Exception as e:
+        logger.error(f"Failed to save note for {card_id}: {e}")
+        return False
 
 
 def delete_note(card_id: str) -> bool:
-    """Delete note for a card"""
-    notes = _load_notes()
-    if card_id in notes:
-        del notes[card_id]
-        return _save_notes(notes)
-    return True
-
+    """Delete note for a card from Elasticsearch"""
+    try:
+        if not check_elasticsearch_connection():
+            return False
+        
+        from elasticsearch_service import es, INDEX_NOTES
+        note_id = f"note_{card_id}"
+        es.delete(index=INDEX_NOTES, id=note_id, ignore=[404])
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete note for {card_id}: {e}")
+        return False

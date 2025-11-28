@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 # Get the directory where this file is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROFILES_FILE = os.path.join(BASE_DIR, "enriched_profiles.json")
+PROFILES_FILE = os.path.join(BASE_DIR, "data", "enriched_profiles.json")
 
 # Cache for loaded profiles
 _profiles_cache: Optional[List[Dict[str, Any]]] = None

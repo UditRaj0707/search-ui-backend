@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 
 # Get the directory where this file is located
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-COMPANIES_FILE = os.path.join(BASE_DIR, "companies_data.json")
+COMPANIES_FILE = os.path.join(BASE_DIR, "data", "companies_data.json")
 
 # Cache for loaded companies
 _companies_cache: Optional[List[Dict[str, Any]]] = None

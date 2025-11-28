@@ -10,12 +10,6 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-from profile_loader import (
-    load_profiles,
-    get_recent_education,
-    get_company_info
-)
-from company_loader import load_companies
 from chat_service import chat_with_ai
 from elasticsearch_service import (
     check_elasticsearch_connection,
@@ -25,7 +19,11 @@ from elasticsearch_service import (
     index_document,
     index_note,
     hybrid_search,
-    rebuild_index
+    rebuild_index,
+    search_companies_es,
+    search_persons_es,
+    search_notes_es,
+    get_card_by_id_es
 )
 from document_extractor import extract_text_from_file
 from upload_status import create_upload_status, update_upload_status, get_upload_status, complete_upload_status
@@ -101,99 +99,101 @@ class NoteResponse(BaseModel):
     note: str
 
 
+class SearchResultsResponse(BaseModel):
+    companies: List[CompanyCardData] = []
+    persons: List[PersonCardData] = []
+    notes: List[dict] = []
+    documents: List[dict] = []
+
+
 # Create uploads directory if it doesn't exist
 BASE_DIR = Path(__file__).parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
 def load_person_cards(count: Optional[int] = None) -> List[PersonCardData]:
-    """Load person cards from enriched profiles"""
-    profiles = load_profiles()
+    """Load person cards from Elasticsearch"""
+    if not check_elasticsearch_connection():
+        return []
     
-    data = []
-    for profile in profiles:
-        profile_data = profile.get("profile_data", {})
+    try:
+        from elasticsearch_service import es, INDEX_PERSONS
         
-        # Get person name
-        name = profile_data.get("name", "Unknown")
-        
-        # Get company and designation
-        company, designation = get_company_info(profile)
-        
-        # Get LinkedIn info
-        linkedin_id = profile.get("linkedin_username", "")
-        linkedin_url = profile.get("linkedin_url", f"https://linkedin.com/in/{linkedin_id}")
-        
-        # Get education
-        education = get_recent_education(profile)
-        
-        # Get experience years
-        experience_years = profile.get("total_experience_years")
-        
-        # Get location
-        location = profile_data.get("location")
-        
-        card_data = PersonCardData(
-            id=f"person_{linkedin_id}",
-            name=name,
-            designation=designation,
-            company=company,
-            linkedin_id=linkedin_id,
-            linkedin_url=linkedin_url,
-            education=education,
-            experience_years=experience_years,
-            location=location,
-            card_type="person"
+        # Get all persons from Elasticsearch
+        response = es.search(
+            index=INDEX_PERSONS,
+            body={"size": count or 20, "query": {"match_all": {}}}
         )
-        data.append(card_data)
         
-        # Limit if count specified
-        if count and len(data) >= count:
-            break
-    
-    return data
+        data = []
+        for hit in response["hits"]["hits"]:
+            metadata = hit["_source"].get("metadata", {})
+            card_data = PersonCardData(
+                id=hit["_source"]["id"],
+                name=metadata.get("name", ""),
+                designation=metadata.get("designation"),
+                company=metadata.get("company"),
+                linkedin_id=metadata.get("linkedin_id", ""),
+                linkedin_url=metadata.get("linkedin_url", ""),
+                education=metadata.get("education"),
+                experience_years=metadata.get("experience_years"),
+                location=metadata.get("location"),
+                card_type="person"
+            )
+            data.append(card_data)
+        
+        return data
+    except Exception as e:
+        logger.error(f"Error loading person cards: {e}")
+        return []
 
 
 def load_company_cards(count: Optional[int] = None) -> List[CompanyCardData]:
-    """Load company cards from companies data"""
-    companies = load_companies()
+    """Load company cards from Elasticsearch"""
+    if not check_elasticsearch_connection():
+        return []
     
-    data = []
-    for company in companies:
-        card_data = CompanyCardData(
-            id=company.get("id", ""),
-            name=company.get("name", ""),
-            industry=company.get("industry"),
-            description=company.get("description"),
-            founded=company.get("founded"),
-            location=company.get("location"),
-            website=company.get("website"),
-            linkedin_url=company.get("linkedin_url"),
-            card_type="company"
-        )
-        data.append(card_data)
+    try:
+        from elasticsearch_service import es, INDEX_COMPANIES
         
-        # Limit if count specified
-        if count and len(data) >= count:
-            break
-    
-    return data
+        # Get all companies from Elasticsearch
+        response = es.search(
+            index=INDEX_COMPANIES,
+            body={"size": count or 20, "query": {"match_all": {}}}
+        )
+        
+        data = []
+        for hit in response["hits"]["hits"]:
+            metadata = hit["_source"].get("metadata", {})
+            card_data = CompanyCardData(
+                id=hit["_source"]["id"],
+                name=metadata.get("name", ""),
+                industry=metadata.get("industry"),
+                description=metadata.get("description"),
+                founded=metadata.get("founded"),
+                location=metadata.get("location"),
+                website=metadata.get("website"),
+                linkedin_url=metadata.get("linkedin_url"),
+                card_type="company"
+            )
+            data.append(card_data)
+        
+        return data
+    except Exception as e:
+        logger.error(f"Error loading company cards: {e}")
+        return []
 
 
 def get_card_by_id(card_id: str) -> Optional[CompanyCardData | PersonCardData]:
-    """Get a card (company or person) by its ID"""
-    # Try to find in company cards
-    companies = load_company_cards()
-    for company in companies:
-        if company.id == card_id:
-            return company
+    """Get a card (company or person) by its ID from Elasticsearch"""
+    card_dict = get_card_by_id_es(card_id)
+    if not card_dict:
+        return None
     
-    # Try to find in person cards
-    persons = load_person_cards()
-    for person in persons:
-        if person.id == card_id:
-            return person
-    
+    if card_dict.get("card_type") == "company":
+        return CompanyCardData(**card_dict)
+    elif card_dict.get("card_type") == "person":
+        return PersonCardData(**card_dict)
     return None
 
 @app.on_event("startup")
@@ -210,8 +210,12 @@ async def startup_event():
     # Initialize Elasticsearch
     if check_elasticsearch_connection():
         create_all_indices()
-        # Optionally rebuild index on startup (comment out if not needed)
-        # rebuild_index()
+        # Rebuild index on startup to load data from JSON files
+        try:
+            rebuild_index()
+            logger.info("Data indexed from JSON files on startup")
+        except Exception as e:
+            logger.warning(f"Failed to rebuild index on startup: {e}")
     else:
         logger.warning("Elasticsearch not available. Search functionality will be limited.")
 
@@ -233,118 +237,136 @@ async def get_cards(card_type: Optional[str] = None):
         persons = load_person_cards(10)
         return companies + persons
 
-@app.get("/api/cards/search")
-async def search_cards(query: str = "", card_type: Optional[str] = None, limit: int = 50):
-    """Search cards using Elasticsearch hybrid search (keyword + semantic)"""
+@app.get("/api/cards/search", response_model=SearchResultsResponse)
+async def search_cards(query: str = "", limit: int = 50):
+    """Search across all categories: companies, persons, notes, and documents"""
     if not query:
         # Return default cards if no query
-        if card_type == "company":
-            return load_company_cards(20)
-        elif card_type == "person":
-            return load_person_cards(20)
-        else:
-            companies = load_company_cards(10)
-            persons = load_person_cards(10)
-            return companies + persons
+        return SearchResultsResponse(
+            companies=load_company_cards(10),
+            persons=load_person_cards(10),
+            notes=[],
+            documents=[]
+        )
     
-    # Use Elasticsearch if available, but fallback to basic search if no results
-    if check_elasticsearch_connection():
-        try:
-            search_results = hybrid_search(query, limit=limit)
+    results = SearchResultsResponse()
+    
+    # Check if Elasticsearch is available
+    es_available = check_elasticsearch_connection()
+    
+    if not es_available:
+        logger.warning("Elasticsearch not available for search")
+        return results
+    
+    # Search companies using Elasticsearch
+    try:
+        company_results = search_companies_es(query, limit=limit)
+        results.companies = []
+        for es_result in company_results:
+            metadata = es_result.get("metadata", {})
+            results.companies.append(
+                CompanyCardData(
+                    id=es_result["id"],
+                    name=metadata.get("name", ""),
+                    industry=metadata.get("industry"),
+                    description=metadata.get("description"),
+                    founded=metadata.get("founded"),
+                    location=metadata.get("location"),
+                    website=metadata.get("website"),
+                    linkedin_url=metadata.get("linkedin_url"),
+                    card_type="company"
+                )
+            )
+    except Exception as e:
+        logger.error(f"Error searching companies: {e}")
+    
+    # Search persons using Elasticsearch
+    try:
+        person_results = search_persons_es(query, limit=limit)
+        results.persons = []
+        for es_result in person_results:
+            metadata = es_result.get("metadata", {})
+            results.persons.append(
+                PersonCardData(
+                    id=es_result["id"],
+                    name=metadata.get("name", ""),
+                    designation=metadata.get("designation"),
+                    company=metadata.get("company"),
+                    linkedin_id=metadata.get("linkedin_id", ""),
+                    linkedin_url=metadata.get("linkedin_url", ""),
+                    education=metadata.get("education"),
+                    experience_years=metadata.get("experience_years"),
+                    location=metadata.get("location"),
+                    card_type="person"
+                )
+            )
+    except Exception as e:
+        logger.error(f"Error searching persons: {e}")
+    
+    # Search notes using Elasticsearch
+    try:
+        note_results = search_notes_es(query, limit=limit)
+        results.notes = []
+        for es_result in note_results:
+            card_id = es_result["card_id"]
+            parent_card = get_card_by_id(card_id)
+            note_data = {
+                "id": es_result["id"],
+                "card_id": card_id,
+                "card_type": es_result.get("metadata", {}).get("card_type", "unknown"),
+                "note": es_result.get("content", ""),
+                "parent_card": None
+            }
+            if parent_card:
+                if isinstance(parent_card, CompanyCardData):
+                    note_data["parent_card"] = {
+                        "id": parent_card.id,
+                        "name": parent_card.name,
+                        "type": "company"
+                    }
+                elif isinstance(parent_card, PersonCardData):
+                    note_data["parent_card"] = {
+                        "id": parent_card.id,
+                        "name": parent_card.name,
+                        "type": "person"
+                    }
+            results.notes.append(note_data)
+    except Exception as e:
+        logger.error(f"Error searching notes: {e}")
+    
+    # Search documents from Elasticsearch (hybrid search)
+    try:
+        if check_elasticsearch_connection():
+            document_results = hybrid_search(query, limit=limit)
+            results.documents = []
+            seen_card_ids = set()
             
-            # Convert search results back to card format
-            cards = []
-            seen_card_ids = set()  # Avoid duplicates
-            
-            for result in search_results:
-                if result["card_type"] == "company":
-                    card_id = result["card_id"]
-                    if card_id not in seen_card_ids:
-                        cards.append(CompanyCardData(
-                            id=card_id,
-                            name=result["title"],
-                            industry=result["metadata"].get("industry"),
-                            description=result["metadata"].get("description"),
-                            founded=result["metadata"].get("founded"),
-                            location=result["metadata"].get("location"),
-                            website=result["metadata"].get("website"),
-                            linkedin_url=result["metadata"].get("linkedin_url"),
-                            card_type="company"
-                        ))
+            for doc_result in document_results:
+                card_id = doc_result["card_id"]
+                if card_id not in seen_card_ids:
+                    # Get parent card
+                    parent_card = get_card_by_id(card_id)
+                    if parent_card:
+                        doc_data = {
+                            "id": doc_result["id"],
+                            "card_id": card_id,
+                            "filename": doc_result["metadata"].get("filename", ""),
+                            "chunk_index": doc_result["metadata"].get("chunk_index", 0),
+                            "content_preview": doc_result["content"][:200] + "..." if len(doc_result["content"]) > 200 else doc_result["content"],
+                            "score": doc_result["score"],
+                            "highlights": doc_result.get("highlights", {}),
+                            "parent_card": {
+                                "id": parent_card.id,
+                                "name": parent_card.name if isinstance(parent_card, CompanyCardData) else parent_card.name,
+                                "type": parent_card.card_type
+                            }
+                        }
+                        results.documents.append(doc_data)
                         seen_card_ids.add(card_id)
-                elif result["card_type"] == "person":
-                    card_id = result["card_id"]
-                    if card_id not in seen_card_ids:
-                        cards.append(PersonCardData(
-                            id=card_id,
-                            name=result["title"],
-                            designation=result["metadata"].get("designation"),
-                            company=result["metadata"].get("company"),
-                            linkedin_id=result["metadata"].get("linkedin_id", ""),
-                            linkedin_url=result["metadata"].get("linkedin_url", ""),
-                            education=result["metadata"].get("education"),
-                            experience_years=result["metadata"].get("experience_years"),
-                            location=result["metadata"].get("location"),
-                            card_type="person"
-                        ))
-                        seen_card_ids.add(card_id)
-                elif result["card_type"] == "document":
-                    # Document chunk found - fetch the parent card
-                    card_id = result["card_id"]
-                    if card_id not in seen_card_ids:
-                        parent_card = get_card_by_id(card_id)
-                        if parent_card:
-                            cards.append(parent_card)
-                            seen_card_ids.add(card_id)
-                            logger.debug(f"Found document match, returning parent card: {card_id}")
-                elif result["card_type"] == "note":
-                    # Note found - fetch the parent card
-                    card_id = result["card_id"]
-                    if card_id not in seen_card_ids:
-                        parent_card = get_card_by_id(card_id)
-                        if parent_card:
-                            cards.append(parent_card)
-                            seen_card_ids.add(card_id)
-                            logger.debug(f"Found note match, returning parent card: {card_id}")
-            
-            # Filter by card_type if specified
-            if card_type:
-                cards = [c for c in cards if c.card_type == card_type]
-            
-            # If Elasticsearch returned results, use them
-            if cards:
-                return cards
-            # If no results from Elasticsearch, fall through to basic search
-            logger.info(f"Elasticsearch returned no results for '{query}', falling back to basic search")
-        except Exception as e:
-            logger.warning(f"Elasticsearch search failed: {e}, falling back to basic search")
-            # Fall through to basic search
+    except Exception as e:
+        logger.error(f"Error searching documents: {e}")
     
-    # Fallback to basic keyword search (always works)
-    all_companies = load_company_cards()
-    all_persons = load_person_cards()
-    
-    query_lower = query.lower()
-    filtered = []
-    
-    if not card_type or card_type == "company":
-        for company in all_companies:
-            if (query_lower in company.name.lower() or
-                (company.industry and query_lower in company.industry.lower()) or
-                (company.description and query_lower in company.description.lower()) or
-                (company.location and query_lower in company.location.lower())):
-                filtered.append(company)
-    
-    if not card_type or card_type == "person":
-        for person in all_persons:
-            if (query_lower in person.name.lower() or
-                (person.company and query_lower in person.company.lower()) or
-                (person.designation and query_lower in person.designation.lower()) or
-                (person.education and query_lower in person.education.lower()) or
-                (person.location and query_lower in person.location.lower())):
-                filtered.append(person)
-    
-    return filtered[:limit]
+    return results
 
 
 @app.post("/api/cards/{card_id}/upload", response_model=FileUploadResponse)
@@ -475,37 +497,36 @@ async def get_card_note(card_id: str):
 async def save_card_note(card_id: str, note_request: NoteRequest):
     """Save note for a card"""
     success = save_note(card_id, note_request.note)
+    
+    # Index note in Elasticsearch if available
+    if success and check_elasticsearch_connection():
+        try:
+            # Get card metadata for indexing
+            card = get_card_by_id(card_id)
+            card_metadata = None
+            if card:
+                if isinstance(card, CompanyCardData):
+                    card_metadata = {
+                        "name": card.name,
+                        "industry": card.industry,
+                        "location": card.location,
+                        "description": card.description
+                    }
+                elif isinstance(card, PersonCardData):
+                    card_metadata = {
+                        "name": card.name,
+                        "company": card.company,
+                        "designation": card.designation,
+                        "education": card.education,
+                        "location": card.location
+                    }
+            
+            card_type = "company" if isinstance(card, CompanyCardData) else "person" if isinstance(card, PersonCardData) else "unknown"
+            index_note(card_id, note_request.note, card_type, card_metadata)
+        except Exception as e:
+            logger.warning(f"Failed to index note in Elasticsearch: {e}")
     if not success:
         raise HTTPException(status_code=500, detail="Failed to save note")
-    
-    # Index the note in Elasticsearch if available
-    if check_elasticsearch_connection():
-        # Get the card to extract metadata
-        card = get_card_by_id(card_id)
-        if card:
-            # Determine card type and build metadata
-            if isinstance(card, CompanyCardData):
-                card_type = "company"
-                card_metadata = {
-                    "name": card.name,
-                    "industry": card.industry,
-                    "location": card.location,
-                    "description": card.description
-                }
-            else:  # PersonCardData
-                card_type = "person"
-                card_metadata = {
-                    "name": card.name,
-                    "company": card.company,
-                    "designation": card.designation,
-                    "education": card.education,
-                    "location": card.location
-                }
-            index_note(card_id, note_request.note, card_type, card_metadata)
-        else:
-            # Fallback if card not found
-            card_type = "person" if card_id.startswith("person_") else "company"
-            index_note(card_id, note_request.note, card_type)
     
     return NoteResponse(note=note_request.note)
 
@@ -523,4 +544,3 @@ async def chat_endpoint(chat_request: ChatMessage):
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat service error: {str(e)}")
-
