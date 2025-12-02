@@ -351,11 +351,17 @@ async def search_cards(query: str = "", limit: int = 50):
                     # Get parent card
                     parent_card = get_card_by_id(card_id)
                     if parent_card:
+                        # Get original filename from metadata, fallback to stored filename
+                        metadata = doc_result.get("metadata", {})
+                        stored_filename = metadata.get("filename", "")
+                        original_filename = metadata.get("original_filename", stored_filename)
+                        
                         doc_data = {
                             "id": doc_result["id"],
                             "card_id": card_id,
-                            "filename": doc_result["metadata"].get("filename", ""),
-                            "chunk_index": doc_result["metadata"].get("chunk_index", 0),
+                            "filename": original_filename,  # Show original filename
+                            "stored_filename": stored_filename,  # Keep stored for reference
+                            "chunk_index": metadata.get("chunk_index", 0),
                             "content_preview": doc_result["content"][:200] + "..." if len(doc_result["content"]) > 200 else doc_result["content"],
                             "score": doc_result["score"],
                             "highlights": doc_result.get("highlights", {}),
@@ -411,11 +417,16 @@ async def upload_file(card_id: str, file: UploadFile = File(...)):
                 # Index document with progress updates
                 update_upload_status(status_id, "chunking", 50, "Chunking document...")
                 try:
+                    # Store both original filename and stored filename in metadata
                     index_document(
                         card_id=card_id,
-                        filename=file.filename or filename,
+                        filename=filename,  # Use stored filename (card_id_uuid.ext) for consistency
                         extracted_text=extracted_text,
-                        metadata={"file_id": file_id, "file_size": len(content)},
+                        metadata={
+                            "file_id": file_id, 
+                            "file_size": len(content),
+                            "original_filename": file.filename or filename  # Keep original for reference
+                        },
                         status_id=status_id
                     )
                     complete_upload_status(status_id, True, "File indexed successfully")
@@ -465,12 +476,88 @@ async def get_card_files(card_id: str):
     files = []
     for file_path in UPLOADS_DIR.glob(f"{card_id}_*"):
         if file_path.is_file():
+            stored_filename = file_path.name
+            
+            # Try to get original filename from Elasticsearch metadata
+            original_filename = stored_filename  # Default to stored filename
+            if check_elasticsearch_connection():
+                try:
+                    from elasticsearch_service import es, INDEX_DOCUMENTS
+                    # Search for any chunk with this filename to get original_filename
+                    search_response = es.search(
+                        index=INDEX_DOCUMENTS,
+                        body={
+                            "query": {
+                                "bool": {
+                                    "must": [
+                                        {"term": {"card_id": card_id}},
+                                        {"match": {"metadata.filename": stored_filename}}
+                                    ]
+                                }
+                            },
+                            "size": 1
+                        }
+                    )
+                    if search_response["hits"]["hits"]:
+                        metadata = search_response["hits"]["hits"][0]["_source"].get("metadata", {})
+                        original_filename = metadata.get("original_filename", stored_filename)
+                except Exception as e:
+                    logger.debug(f"Could not fetch original filename: {e}")
+            
             files.append({
-                "filename": file_path.name,
+                "filename": stored_filename,  # Keep stored filename for deletion
+                "original_filename": original_filename,  # Display name
                 "size": file_path.stat().st_size,
                 "uploaded_at": file_path.stat().st_mtime
             })
     return {"card_id": card_id, "files": files}
+
+
+@app.delete("/api/cards/{card_id}/files/{filename}")
+async def delete_card_file(card_id: str, filename: str):
+    """Delete a file and remove it from Elasticsearch index"""
+    try:
+        # Verify the file belongs to this card
+        file_path = UPLOADS_DIR / filename
+        if not file_path.exists():
+            # File might already be deleted, but we should still try to remove from index
+            logger.warning(f"File {filename} not found on disk, but will attempt to remove from index")
+        else:
+            if not filename.startswith(f"{card_id}_"):
+                raise HTTPException(status_code=403, detail="File does not belong to this card")
+        
+        # Delete from Elasticsearch first (this is the critical part)
+        deletion_success = False
+        if check_elasticsearch_connection():
+            from elasticsearch_service import delete_document_by_filename
+            deletion_success = delete_document_by_filename(card_id, filename)
+            if not deletion_success:
+                logger.warning(f"Failed to delete chunks from Elasticsearch for {filename}")
+        else:
+            logger.warning("Elasticsearch not available, skipping index deletion")
+        
+        # Delete the file from disk
+        if file_path.exists():
+            try:
+                file_path.unlink()
+                logger.info(f"Deleted file {filename} for card {card_id}")
+            except Exception as e:
+                logger.error(f"Failed to delete file {filename}: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to delete file: {str(e)}")
+        
+        if not deletion_success:
+            logger.warning(f"File {filename} deleted from disk but chunks may still exist in index")
+        
+        return {
+            "success": True, 
+            "message": f"File {filename} deleted successfully",
+            "index_deleted": deletion_success
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting file {filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error deleting file: {str(e)}")
 
 
 @app.post("/api/search/index/rebuild")

@@ -266,17 +266,21 @@ def index_document(card_id: str, filename: str, extracted_text: str, metadata: O
             # Generate embedding for this chunk
             embedding = generate_embedding(chunk_text)
             
+            # Get original filename from metadata if available
+            original_filename = (metadata or {}).get("original_filename", filename)
+            
             doc = {
                 "id": chunk_id,
                 "card_id": card_id,
-                "title": f"{filename} (chunk {chunk_idx + 1})",
+                "title": f"{original_filename} (chunk {chunk_idx + 1})",  # Use original filename in title
                 "content": chunk_text,
                 "text_embedding": embedding,
                 "metadata": {
-                    "filename": filename,
+                    "filename": filename,  # Store stored filename for deletion
                     "card_id": card_id,
                     "chunk_index": chunk_idx,
                     "total_chunks": len(chunks),
+                    "original_filename": original_filename,  # Store original for display
                     **(metadata or {})
                 },
                 "created_at": datetime.now().isoformat(),
@@ -297,6 +301,79 @@ def index_document(card_id: str, filename: str, extracted_text: str, metadata: O
         return True
     except Exception as e:
         logger.error(f"Failed to index document {filename}: {e}")
+        return False
+
+
+def delete_document_by_filename(card_id: str, filename: str) -> bool:
+    """Delete all document chunks for a specific filename from Elasticsearch"""
+    try:
+        if not es.indices.exists(index=INDEX_DOCUMENTS):
+            logger.warning(f"Documents index does not exist")
+            return False
+        
+        logger.info(f"Attempting to delete chunks for card_id={card_id}, filename={filename}")
+        
+        # First, search all chunks for this card to see what we have
+        search_all = es.search(
+            index=INDEX_DOCUMENTS,
+            body={
+                "query": {"term": {"card_id": card_id}},
+                "size": 10000
+            }
+        )
+        
+        logger.info(f"Found {search_all['hits']['total']['value']} total chunks for card_id {card_id}")
+        
+        # Filter chunks by filename in metadata (this handles both original and stored filenames)
+        chunks_to_delete = []
+        found_filenames = set()
+        
+        for hit in search_all["hits"]["hits"]:
+            metadata = hit["_source"].get("metadata", {})
+            stored_filename = metadata.get("filename", "")
+            chunk_id = hit["_id"]
+            found_filenames.add(stored_filename)
+            
+            # Match if filename matches stored filename OR if stored filename ends with the given filename
+            # (handles case where stored filename is card_id_uuid.ext but we're searching for original.ext)
+            if stored_filename == filename or stored_filename.endswith(filename) or filename in stored_filename:
+                chunks_to_delete.append(chunk_id)
+                logger.debug(f"Matched chunk {chunk_id} with filename '{stored_filename}'")
+        
+        logger.info(f"Found filenames in index: {found_filenames}")
+        logger.info(f"Matched {len(chunks_to_delete)} chunks to delete")
+        
+        if not chunks_to_delete:
+            logger.warning(f"No chunks found for file {filename} with card_id {card_id}")
+            logger.warning(f"Available filenames for this card: {found_filenames}")
+            return False
+        
+        # Delete chunks individually (more reliable than delete_by_query)
+        deleted_count = 0
+        failed_count = 0
+        
+        for chunk_id in chunks_to_delete:
+            try:
+                es.delete(index=INDEX_DOCUMENTS, id=chunk_id)
+                deleted_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to delete chunk {chunk_id}: {e}")
+                failed_count += 1
+        
+        # Force refresh to make deletions immediately visible
+        es.indices.refresh(index=INDEX_DOCUMENTS)
+        
+        logger.info(f"Deleted {deleted_count} chunks for file {filename} (card_id: {card_id}), {failed_count} failed")
+        
+        if deleted_count == 0:
+            logger.error(f"Failed to delete any chunks! This might indicate a filename mismatch.")
+            return False
+        
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete document chunks for {filename}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 
@@ -954,7 +1031,17 @@ def get_auto_complete_suggestions(query_text: str, limit: int = 5) -> List[Dict[
                         
                     elif index == INDEX_DOCUMENTS: 
                         type_ = "Document"
-                        # For docs, maybe show the first few words of content?
+                        # Use original filename if available, otherwise use stored filename from title
+                        original_filename = meta.get("original_filename")
+                        if original_filename:
+                            text = original_filename
+                        else:
+                            # Extract original filename from title if it contains stored filename
+                            title = src.get("title", "")
+                            # Title format: "{stored_filename} (chunk X)" - we want just the filename part
+                            if " (chunk" in title:
+                                stored_fn = title.split(" (chunk")[0]
+                                text = stored_fn  # Fallback to stored if no original
                         # sub_text = "File" 
                         
                     elif index == INDEX_NOTES:
